@@ -307,6 +307,9 @@ export function buildKiroPayload(model, body, stream, credentials) {
           content: finalContent,
           modelId: model,
           origin: "AI_EDITOR",
+          ...(currentMessage?.userInputMessage?.images?.length > 0 && {
+            images: currentMessage.userInputMessage.images
+          }),
           ...(currentMessage?.userInputMessage?.userInputMessageContext && {
             userInputMessageContext: currentMessage.userInputMessage.userInputMessageContext
           })
