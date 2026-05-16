@@ -48,6 +48,8 @@ export default function ProviderDetailPage() {
   const [suggestedModels, setSuggestedModels] = useState([]);
   const [kiloFreeModels, setKiloFreeModels] = useState([]);
   const [disabledModelIds, setDisabledModelIds] = useState([]);
+  const [importedProviderModels, setImportedProviderModels] = useState([]);
+  const [importingProviderModels, setImportingProviderModels] = useState(false);
   const [confirmState, setConfirmState] = useState(null);
   const { copied, copy } = useCopyToClipboard();
 
@@ -136,6 +138,117 @@ export default function ProviderDetailPage() {
       if (res.ok) await fetchDisabledModels();
     } catch (error) {
       console.log("Error enabling all models:", error);
+    }
+  };
+
+  const resolveImportedModelAlias = (modelId, currentAliases) => {
+    const baseAlias = modelId.includes("/") ? modelId.split("/").pop() : modelId;
+    const candidates = [baseAlias, modelId, `${providerStorageAlias}-${baseAlias}`]
+      .filter(Boolean)
+      .filter((value, index, arr) => arr.indexOf(value) === index);
+
+    for (const candidate of candidates) {
+      if (!currentAliases[candidate] || currentAliases[candidate] === `${providerStorageAlias}/${modelId}`) {
+        return candidate;
+      }
+    }
+    return null;
+  };
+
+  const handleImportProviderModels = async () => {
+    if (importingProviderModels) return;
+    const activeConnection = connections.find((conn) => conn.isActive !== false);
+    if (!activeConnection) {
+      alert("Add an active Kiro connection before importing models.");
+      return;
+    }
+
+    setImportingProviderModels(true);
+    setModelsTestError("");
+    try {
+      const res = await fetch(`/api/providers/${activeConnection.id}/models`, { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || "Failed to import models");
+        return;
+      }
+
+      const remoteModels = Array.isArray(data.models)
+        ? data.models
+          .map((model) => {
+            const id = model?.id || model?.name || model?.model;
+            if (!id) return null;
+            return {
+              ...model,
+              id,
+              name: model?.name || model?.displayName || id,
+            };
+          })
+          .filter(Boolean)
+        : [];
+      if (remoteModels.length === 0) {
+        alert(data.warning || "No models returned from provider.");
+        return;
+      }
+
+      setImportedProviderModels(remoteModels);
+
+      let importedCount = 0;
+      let skippedCount = 0;
+      let reactivatedCount = 0;
+      const nextAliases = { ...modelAliases };
+      const disabledIds = new Set(disabledModelIds);
+
+      for (const model of remoteModels) {
+        const modelId = model.id;
+
+        const fullModel = `${providerStorageAlias}/${modelId}`;
+        if (Object.values(nextAliases).includes(fullModel)) {
+          skippedCount += 1;
+          continue;
+        }
+
+        const alias = resolveImportedModelAlias(modelId, nextAliases);
+        if (!alias) {
+          skippedCount += 1;
+          continue;
+        }
+
+        const aliasRes = await fetch("/api/models/alias", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: fullModel, alias }),
+        });
+
+        if (aliasRes.ok) {
+          nextAliases[alias] = fullModel;
+          importedCount += 1;
+        } else {
+          skippedCount += 1;
+        }
+      }
+
+      for (const model of remoteModels) {
+        if (!disabledIds.has(model.id)) continue;
+        const enableRes = await fetch(`/api/models/disabled?providerAlias=${encodeURIComponent(providerStorageAlias)}&id=${encodeURIComponent(model.id)}`, { method: "DELETE" });
+        if (enableRes.ok) {
+          reactivatedCount += 1;
+        }
+      }
+
+      await fetchAliases();
+      if (reactivatedCount > 0) await fetchDisabledModels();
+
+      if (importedCount === 0 && reactivatedCount === 0) {
+        alert(data.warning || `No new models were added.${skippedCount ? ` ${skippedCount} already existed or conflicted.` : ""}`);
+      } else if (data.warning) {
+        alert(`Imported ${importedCount} model(s), re-enabled ${reactivatedCount} model(s). Warning: ${data.warning}`);
+      }
+    } catch (error) {
+      console.log("Error importing provider models:", error);
+      alert("Failed to import models from provider.");
+    } finally {
+      setImportingProviderModels(false);
     }
   };
 
@@ -689,9 +802,10 @@ export default function ProviderDetailPage() {
     }
     // Combine hardcoded models with Kilo free models (deduplicated)
     // Exclude non-llm models (embedding, tts, etc.) — they have dedicated pages under media-providers
+    const baseModels = providerId === "kiro" && importedProviderModels.length > 0 ? importedProviderModels : models;
     const allModels = [
-      ...models,
-      ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
+      ...baseModels,
+      ...kiloFreeModels.filter((fm) => !baseModels.some((m) => m.id === fm.id)),
     ].filter((m) => !m.type || m.type === "llm");
     const disabledSet = new Set(disabledModelIds);
     const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
@@ -704,8 +818,8 @@ export default function ProviderDetailPage() {
         const modelId = fullModel.slice(prefix.length);
         // Only show if not already in hardcoded list
         // For passthroughModels, include all aliases (model IDs may contain slashes like "anthropic/claude-3")
-        if (providerInfo.passthroughModels) return !models.some((m) => m.id === modelId);
-        return !models.some((m) => m.id === modelId) && alias === modelId;
+        if (providerInfo.passthroughModels) return !baseModels.some((m) => m.id === modelId);
+        return !baseModels.some((m) => m.id === modelId) && alias === modelId;
       })
       .map(([alias, fullModel]) => ({
         id: fullModel.slice(`${providerStorageAlias}/`.length),
@@ -771,7 +885,7 @@ export default function ProviderDetailPage() {
         {/* Suggested models from provider API — show only models not yet added */}
         {suggestedModels.length > 0 && (() => {
           const addedFullModels = new Set(Object.values(modelAliases));
-          const hardcodedIds = new Set(models.map((m) => m.id));
+          const hardcodedIds = new Set(baseModels.map((m) => m.id));
           const notAdded = suggestedModels.filter(
             (m) => !addedFullModels.has(`${providerStorageAlias}/${m.id}`) && !hardcodedIds.has(m.id)
           );
@@ -1126,12 +1240,24 @@ export default function ProviderDetailPage() {
           </h2>
           {!isCompatible && (() => {
             const allIds = [
-              ...models,
-              ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
+              ...(providerId === "kiro" && importedProviderModels.length > 0 ? importedProviderModels : models),
+              ...kiloFreeModels.filter((fm) => !(providerId === "kiro" && importedProviderModels.length > 0 ? importedProviderModels : models).some((m) => m.id === fm.id)),
             ].filter((m) => !m.type || m.type === "llm").map((m) => m.id);
             const activeIds = allIds.filter((id) => !disabledModelIds.includes(id));
             return (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
+                {providerId === "kiro" && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    icon="download"
+                    onClick={handleImportProviderModels}
+                    disabled={importingProviderModels || !connections.some((conn) => conn.isActive !== false)}
+                    title={connections.some((conn) => conn.isActive !== false) ? "Import live models from Kiro" : "Add an active Kiro connection first"}
+                  >
+                    {importingProviderModels ? "Importing..." : "Import Models"}
+                  </Button>
+                )}
                 {disabledModelIds.length > 0 && (
                   <Button size="sm" variant="secondary" icon="restart_alt" onClick={handleEnableAll}>
                     Active All
