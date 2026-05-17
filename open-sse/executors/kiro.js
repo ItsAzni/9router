@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from "uuid";
 import { refreshKiroToken } from "../services/tokenRefresh.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { HTTP_STATUS, RETRY_CONFIG, DEFAULT_RETRY_CONFIG, resolveRetryEntry } from "../config/runtimeConfig.js";
+import { splitKiroThinkingContent, flushKiroThinkingContent } from "../utils/kiroThinking.js";
 
 /**
  * KiroExecutor - Executor for Kiro AI (AWS CodeWhisperer)
@@ -123,11 +124,7 @@ export class KiroExecutor extends BaseExecutor {
           if (!state.totalContentLength) state.totalContentLength = 0;
           if (!state.contextUsagePercentage) state.contextUsagePercentage = 0;
 
-          // Handle assistantResponseEvent
-          if (eventType === "assistantResponseEvent" && event.payload?.content) {
-            const content = event.payload.content;
-            state.totalContentLength += content.length;
-            
+          const enqueueOpenAIChunk = (delta, finish_reason = null) => {
             const chunk = {
               id: responseId,
               object: "chat.completion.chunk",
@@ -135,14 +132,29 @@ export class KiroExecutor extends BaseExecutor {
               model,
               choices: [{
                 index: 0,
-                delta: chunkIndex === 0
-                  ? { role: "assistant", content }
-                  : { content },
-                finish_reason: null
+                delta: chunkIndex === 0 ? { role: "assistant", ...delta } : delta,
+                finish_reason
               }]
             };
             chunkIndex++;
             controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            return chunk;
+          };
+
+          // Handle assistantResponseEvent
+          if (eventType === "assistantResponseEvent" && event.payload?.content) {
+            const content = event.payload.content;
+            const segments = splitKiroThinkingContent(content, state);
+            for (const segment of segments) {
+              state.totalContentLength += segment.text.length;
+              if (segment.type === "reasoning") {
+                state.hasReasoningContent = true;
+                state.reasoningChunkCount++;
+                enqueueOpenAIChunk({ reasoning_content: segment.text });
+              } else {
+                enqueueOpenAIChunk({ content: segment.text });
+              }
+            }
           }
 
           // Handle reasoningContentEvent (Kiro thinking / reasoning)
@@ -280,6 +292,17 @@ export class KiroExecutor extends BaseExecutor {
 
           // Handle messageStopEvent
           if (eventType === "messageStopEvent") {
+            for (const segment of flushKiroThinkingContent(state)) {
+              state.totalContentLength += segment.text.length;
+              if (segment.type === "reasoning") {
+                state.hasReasoningContent = true;
+                state.reasoningChunkCount++;
+                enqueueOpenAIChunk({ reasoning_content: segment.text });
+              } else {
+                enqueueOpenAIChunk({ content: segment.text });
+              }
+            }
+
             const chunk = {
               id: responseId,
               object: "chat.completion.chunk",
@@ -376,6 +399,30 @@ export class KiroExecutor extends BaseExecutor {
       },
 
       flush(controller) {
+        for (const segment of flushKiroThinkingContent(state)) {
+          state.totalContentLength += segment.text.length;
+          const delta = segment.type === "reasoning"
+            ? { ...(chunkIndex === 0 ? { role: "assistant" } : {}), reasoning_content: segment.text }
+            : { ...(chunkIndex === 0 ? { role: "assistant" } : {}), content: segment.text };
+          if (segment.type === "reasoning") {
+            state.hasReasoningContent = true;
+            state.reasoningChunkCount++;
+          }
+          const pendingChunk = {
+            id: responseId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta,
+              finish_reason: null
+            }]
+          };
+          chunkIndex++;
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(pendingChunk)}\n\n`));
+        }
+
         // Emit finish chunk if not already sent
         if (!state.finishEmitted) {
           state.finishEmitted = true;

@@ -4,6 +4,27 @@
  */
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
+import { splitKiroThinkingContent, flushKiroThinkingContent } from "../../utils/kiroThinking.js";
+
+function createKiroOpenAIChunk(state, delta, finishReason = null) {
+  const openaiChunk = {
+    id: state.responseId,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model || "kiro",
+    choices: [{
+      index: 0,
+      delta: {
+        ...(state.chunkIndex === 0 ? { role: "assistant" } : {}),
+        ...delta
+      },
+      finish_reason: finishReason
+    }]
+  };
+
+  state.chunkIndex++;
+  return openaiChunk;
+}
 
 /**
  * Parse Kiro SSE event and convert to OpenAI format
@@ -66,23 +87,16 @@ export function convertKiroToOpenAI(chunk, state) {
     const content = data.assistantResponseEvent?.content || data.content || "";
     if (!content) return null;
 
-    const openaiChunk = {
-      id: state.responseId,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model || "kiro",
-      choices: [{
-        index: 0,
-        delta: {
-          ...(state.chunkIndex === 0 ? { role: "assistant" } : {}),
-          content: content
-        },
-        finish_reason: null
-      }]
-    };
-
-    state.chunkIndex++;
-    return openaiChunk;
+    const results = [];
+    for (const segment of splitKiroThinkingContent(content, state)) {
+      results.push(createKiroOpenAIChunk(
+        state,
+        segment.type === "reasoning"
+          ? { reasoning_content: segment.text }
+          : { content: segment.text }
+      ));
+    }
+    return results.length > 0 ? results : null;
   }
 
   // Handle reasoning/thinking events.
@@ -153,6 +167,13 @@ export function convertKiroToOpenAI(chunk, state) {
   // Handle completion/done events
   if (eventType === "messageStopEvent" || eventType === "done" || data.messageStopEvent) {
     state.finishReason = "stop"; // Mark for usage injection in stream.js
+
+    const flushed = flushKiroThinkingContent(state).map(segment => createKiroOpenAIChunk(
+      state,
+      segment.type === "reasoning"
+        ? { reasoning_content: segment.text }
+        : { content: segment.text }
+    ));
     
     const openaiChunk = {
       id: state.responseId,
@@ -169,6 +190,10 @@ export function convertKiroToOpenAI(chunk, state) {
     // Include usage in final chunk if available
     if (state.usage && typeof state.usage === "object") {
       openaiChunk.usage = state.usage;
+    }
+
+    if (flushed.length > 0) {
+      return [...flushed, openaiChunk];
     }
 
     return openaiChunk;
